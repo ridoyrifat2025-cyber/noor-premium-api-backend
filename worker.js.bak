@@ -1,0 +1,507 @@
+/* =========================================================
+   NOOR PREMIUM — CLOUDFLARE WORKER API (D1 + RBAC + RATE LIMIT)
+   ========================================================= */
+
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_AUTH = 20;
+const rateBuckets = new Map();
+
+function jsonResponse(payload, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type,Authorization,X-CSRF-Token,X-Admin-Key",
+      ...extraHeaders
+    }
+  });
+}
+
+function checkRateLimit(ipKey) {
+  const now = Date.now();
+  const entry = rateBuckets.get(ipKey);
+  if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+    rateBuckets.set(ipKey, { windowStart: now, count: 1 });
+    return { allowed: true };
+  }
+  entry.count += 1;
+  if (entry.count > RATE_LIMIT_MAX_AUTH) {
+    return { allowed: false, retryAfterSec: Math.ceil((RATE_LIMIT_WINDOW_MS - (now - entry.windowStart)) / 1000) };
+  }
+  return { allowed: true };
+}
+
+function sanitizeMediaUrl(raw) {
+  const val = String(raw || "").trim();
+  if (!val) return "";
+  if (val.startsWith("/")) return val;
+  try {
+    const parsed = new URL(val);
+    if (parsed.protocol === "https:" || parsed.protocol === "http:") {
+      return parsed.toString();
+    }
+    return "";
+  } catch (_) {
+    return "";
+  }
+}
+
+async function hashPasswordPbkdf2(password, saltHex = null) {
+  const enc = new TextEncoder();
+  const saltBytes = saltHex
+    ? new Uint8Array(saltHex.match(/.{1,2}/g).map((b) => parseInt(b, 16)))
+    : crypto.getRandomValues(new Uint8Array(16));
+
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(String(password)),
+    { name: "PBKDF2" },
+    false,
+    ["deriveBits"]
+  );
+
+  const derivedBits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      salt: saltBytes,
+      iterations: 100_000,
+      hash: "SHA-256"
+    },
+    keyMaterial,
+    256
+  );
+
+  const salt = Array.from(saltBytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  const hash = Array.from(new Uint8Array(derivedBits))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+
+  return `${salt}:${hash}`;
+}
+
+async function verifyPasswordPbkdf2(password, storedValue) {
+  const parts = String(storedValue || "").split(":");
+  if (parts.length !== 2) return false;
+  const [saltHex, expectedHash] = parts;
+  const computed = await hashPasswordPbkdf2(password, saltHex);
+  const [, actualHash] = computed.split(":");
+  return actualHash === expectedHash;
+}
+
+function getUserKeyFromRequest(request) {
+  const auth = request.headers.get("Authorization") || "";
+  if (auth.startsWith("Bearer ") && auth.length > 10) {
+    return auth.slice(7).trim().slice(0, 64);
+  }
+  return "guest_user";
+}
+
+async function isAdminRequest(request, env) {
+  const adminKey = request.headers.get("X-Admin-Key") || "";
+  if (env.ADMIN_API_KEY && adminKey === env.ADMIN_API_KEY) return true;
+
+  const auth = request.headers.get("Authorization") || "";
+  if (!auth.startsWith("Bearer ")) return false;
+
+  const token = auth.slice(7).trim();
+  if (!token) return false;
+  if (token.startsWith("np_admin_")) return true;
+
+  const parts = token.split("_");
+  const candidateUserId = parts.length >= 3 ? parts[2] : "";
+  if (candidateUserId && env.DB) {
+    const userRow = await env.DB
+      .prepare("SELECT role FROM users WHERE id = ?")
+      .bind(candidateUserId)
+      .first();
+    if (userRow && userRow.role === "admin") return true;
+  }
+
+  return false;
+}
+
+async function ensureTables(db) {
+  if (!db) return;
+  await db.batch([
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        full_name TEXT NOT NULL,
+        email TEXT NOT NULL UNIQUE,
+        username TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'user',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `),
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS contents (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        content_type TEXT NOT NULL DEFAULT 'movie',
+        release_year INTEGER NOT NULL DEFAULT 2026,
+        genre TEXT NOT NULL DEFAULT 'Drama',
+        language TEXT NOT NULL DEFAULT 'Bengali',
+        rating REAL NOT NULL DEFAULT 8.0,
+        synopsis TEXT NOT NULL DEFAULT '',
+        stream_url TEXT NOT NULL DEFAULT '',
+        poster_url TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'draft',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `),
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS watchlist (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_key TEXT NOT NULL,
+        content_type TEXT NOT NULL DEFAULT 'movie',
+        content_id TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(user_key, content_type, content_id)
+      )
+    `),
+    db.prepare(`
+      CREATE TABLE IF NOT EXISTS watch_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_key TEXT NOT NULL,
+        content_id TEXT NOT NULL,
+        content_type TEXT NOT NULL DEFAULT 'movie',
+        title TEXT NOT NULL DEFAULT '',
+        progress_percent INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE(user_key, content_id)
+      )
+    `)
+  ]);
+}
+
+function mapContentRow(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    type: row.content_type || "movie",
+    releaseYear: row.release_year || 2026,
+    synopsis: row.synopsis || "",
+    streamUrl: row.stream_url || "",
+    posterUrl: row.poster_url || "",
+    status: row.status || "draft"
+  };
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method.toUpperCase();
+
+    if (method === "OPTIONS") {
+      return jsonResponse({ success: true }, 204);
+    }
+
+    if (path.startsWith("/api/v1/auth/")) {
+      const ip = request.headers.get("CF-Connecting-IP") || "local";
+      const rl = checkRateLimit(`${ip}:${path}`);
+      if (!rl.allowed) {
+        return jsonResponse(
+          { success: false, error: `অনেক বেশি চেষ্টা করা হয়েছে। ${rl.retryAfterSec} সেকেন্ড পর চেষ্টা করুন।` },
+          429,
+          { "Retry-After": String(rl.retryAfterSec) }
+        );
+      }
+    }
+
+    if (path === "/api/v1/health" && method === "GET") {
+      return jsonResponse({
+        success: true,
+        data: {
+          app: env.APP_NAME || "NOOR PREMIUM",
+          dbBound: Boolean(env.DB),
+          timestamp: new Date().toISOString()
+        }
+      });
+    }
+
+    if (path === "/api/v1/auth/register" && method === "POST") {
+      if (!env.DB) return jsonResponse({ success: false, error: "D1 DB not bound" }, 500);
+      await ensureTables(env.DB);
+      const body = await request.json().catch(() => ({}));
+      const fullName = String(body.fullName || "").trim();
+      const email = String(body.email || "").trim().toLowerCase();
+      const username = String(body.username || email.split("@")[0] || "").trim().toLowerCase();
+      const password = String(body.password || "");
+
+      if (!email || !username || password.length < 6) {
+        return jsonResponse({ success: false, error: "সঠিক ইমেইল, ইউজারনেম ও কমপক্ষে ৬ অক্ষরের পাসওয়ার্ড দিন।" }, 400);
+      }
+
+      const existing = await env.DB
+        .prepare("SELECT id FROM users WHERE email = ? OR username = ?")
+        .bind(email, username)
+        .first();
+
+      if (existing) {
+        return jsonResponse({ success: false, error: "এই ইমেইল বা ইউজারনেম দিয়ে ইতিমধ্যে অ্যাকাউন্ট আছে।" }, 409);
+      }
+
+      const id = `usr-${crypto.randomUUID().slice(0, 8)}`;
+      const passwordHash = await hashPasswordPbkdf2(password);
+      await env.DB
+        .prepare("INSERT INTO users (id, full_name, email, username, password_hash, role) VALUES (?, ?, ?, ?, ?, 'user')")
+        .bind(id, fullName || username, email, username, passwordHash)
+        .run();
+
+      const token = `np_tok_${id}_${crypto.randomUUID().slice(0, 12)}`;
+      return jsonResponse({
+        success: true,
+        data: {
+          token,
+          user: { id, fullName: fullName || username, email, username, role: "user" }
+        }
+      });
+    }
+
+    if (path === "/api/v1/auth/login" && method === "POST") {
+      if (!env.DB) return jsonResponse({ success: false, error: "D1 DB not bound" }, 500);
+      await ensureTables(env.DB);
+      const body = await request.json().catch(() => ({}));
+      const identifier = String(body.identifier || "").trim().toLowerCase();
+      const password = String(body.password || "");
+
+      const user = await env.DB
+        .prepare("SELECT id, full_name, email, username, password_hash, role FROM users WHERE email = ? OR username = ?")
+        .bind(identifier, identifier)
+        .first();
+
+      if (!user || !(await verifyPasswordPbkdf2(password, user.password_hash))) {
+        return jsonResponse({ success: false, error: "ইমেইল/ইউজারনেম অথবা পাসওয়ার্ড সঠিক নয়।" }, 401);
+      }
+
+      const prefix = user.role === "admin" ? "np_admin" : "np_tok";
+      const token = `${prefix}_${user.id}_${crypto.randomUUID().slice(0, 12)}`;
+      return jsonResponse({
+        success: true,
+        data: {
+          token,
+          user: {
+            id: user.id,
+            fullName: user.full_name,
+            email: user.email,
+            username: user.username,
+            role: user.role
+          }
+        }
+      });
+    }
+
+    if (path === "/api/v1/auth/logout" && method === "POST") {
+      return jsonResponse({ success: true, data: { loggedOut: true } });
+    }
+
+    if (path === "/api/v1/catalog" && method === "GET") {
+      if (!env.DB) return jsonResponse({ success: true, data: { items: [] } });
+      await ensureTables(env.DB);
+      const rows = await env.DB
+        .prepare("SELECT * FROM contents WHERE status = 'published' ORDER BY rowid DESC")
+        .all();
+      return jsonResponse({
+        success: true,
+        data: { items: (rows.results || []).map(mapContentRow) }
+      });
+    }
+
+    if (path.startsWith("/api/v1/catalog/") && method === "GET") {
+      const id = decodeURIComponent(path.replace("/api/v1/catalog/", ""));
+      if (!env.DB) return jsonResponse({ success: false, error: "Not found" }, 404);
+      await ensureTables(env.DB);
+      const row = await env.DB
+        .prepare("SELECT * FROM contents WHERE id = ? AND status = 'published'")
+        .bind(id)
+        .first();
+      if (!row) return jsonResponse({ success: false, error: "Content not found" }, 404);
+      return jsonResponse({ success: true, data: { item: mapContentRow(row) } });
+    }
+
+    if (path === "/api/v1/watchlist") {
+      if (!env.DB) return jsonResponse({ success: true, data: { items: [] } });
+      await ensureTables(env.DB);
+      const userKey = getUserKeyFromRequest(request);
+
+      if (method === "GET") {
+        const rows = await env.DB
+          .prepare("SELECT content_type, content_id, created_at FROM watchlist WHERE user_key = ? ORDER BY id DESC")
+          .bind(userKey)
+          .all();
+        return jsonResponse({
+          success: true,
+          data: {
+            items: (rows.results || []).map((r) => ({
+              contentType: r.content_type,
+              contentId: r.content_id,
+              addedAt: r.created_at
+            }))
+          }
+        });
+      }
+
+      const body = await request.json().catch(() => ({}));
+      const contentType = body.contentType === "series" ? "series" : "movie";
+      const contentId = String(body.contentId || "").trim();
+      if (!contentId) return jsonResponse({ success: false, error: "contentId required" }, 400);
+
+      if (method === "POST") {
+        await env.DB
+          .prepare("INSERT OR IGNORE INTO watchlist (user_key, content_type, content_id) VALUES (?, ?, ?)")
+          .bind(userKey, contentType, contentId)
+          .run();
+        return jsonResponse({ success: true });
+      }
+
+      if (method === "DELETE") {
+        await env.DB
+          .prepare("DELETE FROM watchlist WHERE user_key = ? AND content_id = ?")
+          .bind(userKey, contentId)
+          .run();
+        return jsonResponse({ success: true });
+      }
+    }
+
+    if (path === "/api/v1/history") {
+      if (!env.DB) return jsonResponse({ success: true, data: { items: [] } });
+      await ensureTables(env.DB);
+      const userKey = getUserKeyFromRequest(request);
+
+      if (method === "GET") {
+        const rows = await env.DB
+          .prepare("SELECT content_id, content_type, title, progress_percent, updated_at FROM watch_history WHERE user_key = ? ORDER BY updated_at DESC LIMIT 30")
+          .bind(userKey)
+          .all();
+        return jsonResponse({
+          success: true,
+          data: {
+            items: (rows.results || []).map((r) => ({
+              contentId: r.content_id,
+              contentType: r.content_type,
+              title: r.title,
+              progressPercent: r.progress_percent,
+              updatedAt: r.updated_at
+            }))
+          }
+        });
+      }
+
+      if (method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const contentId = String(body.contentId || "").trim();
+        const contentType = body.contentType === "series" ? "series" : "movie";
+        const title = String(body.title || contentId).trim();
+        const progressPercent = Math.max(0, Math.min(100, Number(body.progressPercent) || 0));
+        if (!contentId) return jsonResponse({ success: false, error: "contentId required" }, 400);
+
+        await env.DB
+          .prepare(`
+            INSERT INTO watch_history (user_key, content_id, content_type, title, progress_percent, updated_at)
+            VALUES (?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(user_key, content_id) DO UPDATE SET
+              title = excluded.title,
+              progress_percent = excluded.progress_percent,
+              updated_at = datetime('now')
+          `)
+          .bind(userKey, contentId, contentType, title, progressPercent)
+          .run();
+
+        return jsonResponse({ success: true });
+      }
+    }
+
+    if (path.startsWith("/api/v1/admin/")) {
+      if (!(await isAdminRequest(request, env))) {
+        return jsonResponse({ success: false, error: "Admin authorization required" }, 401);
+      }
+      if (!env.DB) return jsonResponse({ success: false, error: "D1 DB not bound" }, 500);
+      await ensureTables(env.DB);
+
+      if (path === "/api/v1/admin/content" && method === "GET") {
+        const rows = await env.DB.prepare("SELECT * FROM contents ORDER BY rowid DESC").all();
+        return jsonResponse({ success: true, data: { items: (rows.results || []).map(mapContentRow) } });
+      }
+
+      if (path === "/api/v1/admin/content" && method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const id = String(body.id || `cnt-${crypto.randomUUID().slice(0, 6)}`).trim();
+        const title = String(body.title || "").trim();
+        const type = body.type === "series" ? "series" : "movie";
+        const releaseYear = Number(body.releaseYear) || 2026;
+        const synopsis = String(body.synopsis || "").trim();
+        const streamUrl = sanitizeMediaUrl(body.streamUrl);
+        const posterUrl = sanitizeMediaUrl(body.posterUrl);
+
+        if (!title) return jsonResponse({ success: false, error: "Title required" }, 400);
+
+        await env.DB
+          .prepare(`
+            INSERT INTO contents (id, title, content_type, release_year, synopsis, stream_url, poster_url, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'draft')
+          `)
+          .bind(id, title, type, releaseYear, synopsis, streamUrl, posterUrl)
+          .run();
+
+        return jsonResponse({
+          success: true,
+          data: {
+            item: { id, title, type, releaseYear, synopsis, streamUrl, posterUrl, status: "draft" }
+          }
+        });
+      }
+
+      const statusMatch = path.match(/^\/api\/v1\/admin\/content\/([^/]+)\/status$/);
+      if (statusMatch && method === "PATCH") {
+        const id = decodeURIComponent(statusMatch[1]);
+        const body = await request.json().catch(() => ({}));
+        const nextStatus = body.status === "published" ? "published" : "draft";
+        await env.DB
+          .prepare("UPDATE contents SET status = ?, updated_at = datetime('now') WHERE id = ?")
+          .bind(nextStatus, id)
+          .run();
+        return jsonResponse({ success: true, data: { id, status: nextStatus } });
+      }
+
+      const itemMatch = path.match(/^\/api\/v1\/admin\/content\/([^/]+)$/);
+      if (itemMatch && method === "PATCH") {
+        const id = decodeURIComponent(itemMatch[1]);
+        const body = await request.json().catch(() => ({}));
+        const existing = await env.DB.prepare("SELECT * FROM contents WHERE id = ?").bind(id).first();
+        if (!existing) return jsonResponse({ success: false, error: "Not found" }, 404);
+
+        const nextTitle = body.title !== undefined ? String(body.title).trim() : existing.title;
+        const nextYear = body.releaseYear !== undefined ? Number(body.releaseYear) || existing.release_year : existing.release_year;
+        const nextSynopsis = body.synopsis !== undefined ? String(body.synopsis).trim() : existing.synopsis;
+        const nextStream = body.streamUrl !== undefined ? sanitizeMediaUrl(body.streamUrl) : existing.stream_url;
+        const nextPoster = body.posterUrl !== undefined ? sanitizeMediaUrl(body.posterUrl) : existing.poster_url;
+
+        await env.DB
+          .prepare(`
+            UPDATE contents
+            SET title = ?, release_year = ?, synopsis = ?, stream_url = ?, poster_url = ?, updated_at = datetime('now')
+            WHERE id = ?
+          `)
+          .bind(nextTitle, nextYear, nextSynopsis, nextStream, nextPoster, id)
+          .run();
+
+        return jsonResponse({ success: true });
+      }
+
+      if (itemMatch && method === "DELETE") {
+        const id = decodeURIComponent(itemMatch[1]);
+        await env.DB.prepare("DELETE FROM contents WHERE id = ?").bind(id).run();
+        return jsonResponse({ success: true });
+      }
+    }
+
+    return jsonResponse({ success: false, error: "Not found" }, 404);
+  }
+};

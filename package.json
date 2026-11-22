@@ -1,0 +1,16 @@
+{
+  "name": "noor-premium-backend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init": "wrangler d1 execute noor_premium_db --file=./schema.sql",
+    "db:seed": "wrangler d1 execute noor_premium_db --file=./seed.sql",
+    "test:smoke": "node ./smoke-test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^3.99.0"
+  }
+}

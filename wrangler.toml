@@ -1,0 +1,15 @@
+name = "noor-premium-api"
+main = "worker.js"
+compatibility_date = "2026-01-15"
+
+[vars]
+APP_NAME = "NOOR PREMIUM"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "noor_premium_db"
+database_id = "F4cc309c-124d-48a3-a05b-0295055fea9e"
+
+[[r2_buckets]]
+binding = "MEDIA_BUCKET"
+bucket_name = "noor-premium-media"

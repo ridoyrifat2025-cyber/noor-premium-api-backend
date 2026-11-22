@@ -1,0 +1,4 @@
+-- =========================================================
+-- NOOR PREMIUM — LEGACY SEED PLACEHOLDER (DEPRECATED)
+-- Use backend/migrations/0002_seed_catalog.sql for catalog seed data.
+-- =========================================================
