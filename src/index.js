@@ -55,7 +55,9 @@ async function getAuthenticatedUser(request, env) {
   if (!env || !env.DB) return null;
 
   const cookies = parseCookies(request.headers.get("Cookie") || "");
-  const rawToken = cookies[SESSION_COOKIE_NAME];
+  const authHeader = request.headers.get("Authorization") || "";
+  const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+  const rawToken = cookies[SESSION_COOKIE_NAME] || bearerToken;
   if (!rawToken) return null;
 
   const tokenHash = await sha256Hex(rawToken);
