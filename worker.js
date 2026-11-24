@@ -1320,6 +1320,11 @@ const v1Worker = {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method.toUpperCase();
+    if (method === "OPTIONS") {
+      const h = new Headers();
+      applySecurityHeaders(h, { isJson: false });
+      return new Response(null, { status: 204, headers: h });
+    }
 
     if (path === "/api/v1/health" && method === "GET") {
       const csrf = ensureCsrfToken(request);
