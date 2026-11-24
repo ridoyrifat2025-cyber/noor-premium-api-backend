@@ -1452,19 +1452,6 @@ function jsonResponse(payload, status = 200, extraHeaders = {}) {
   });
 }
 
-function checkRateLimit(ipKey) {
-  const now = Date.now();
-  const entry = rateBuckets.get(ipKey);
-  if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
-    rateBuckets.set(ipKey, { windowStart: now, count: 1 });
-    return { allowed: true };
-  }
-  entry.count += 1;
-  if (entry.count > RATE_LIMIT_MAX_AUTH) {
-    return { allowed: false, retryAfterSec: Math.ceil((RATE_LIMIT_WINDOW_MS - (now - entry.windowStart)) / 1000) };
-  }
-  return { allowed: true };
-}
 
 function sanitizeMediaUrl(raw) {
   const val = String(raw || "").trim();
@@ -1947,7 +1934,6 @@ async function legacyFetch(request, env) {
 
     return jsonResponse({ success: false, error: "Not found" }, 404);
   }
-};
 
 
 export default {
